@@ -1,29 +1,37 @@
-# eval.nix — the evaluation half of nix-pins.
+# eval.nix — the evaluation half of nix-pins: `lib.mkNixPins { … }`.
 #
-# This is imported by the user's flake as the `nix-pins` output. Everything the
-# CLI needs *from evaluation* is exposed as a flake attribute, so the CLI never
-# composes Nix expressions in strings — pure evaluation throughout:
+# The consuming flake exposes the result as its `nix-pins` output. Everything the
+# CLI needs *from evaluation* is a flake attribute, so the CLI never composes Nix
+# expressions in strings — pure evaluation throughout:
 #
 #   .#nix-pins.manifest                     { platforms, entries } — JSON-safe
+#   .#nix-pins.layout                       repo-relative paths the CLI reads/edits
 #   .#nix-pins.report                       nixpkgs version + stillNeeded verdict per entry
 #   .#nix-pins.src."<name>"."<system>"      the entry's src, described (urls/hash/mode/name/rev)
 #   .#nix-pins.drv."<name>"."<system>"      the entry's derivation, for `nix build`
+#   .#nix-pins.casks."<token>"              a cask as the host resolves it (Auto Pin build check)
 #   .#nix-pins.overlays.<platform>.{pre,post}  the overlay lists the flake applies,
 #                                           built from each entry's `enable` field
+#   .#nix-pins.autoPinOverlays              the Auto Pins in autoPinsDir, as overlays
 #   .#nix-pins.applied.<platform>           names behind those lists (dashboard truth)
 #   .#nix-pins.installed."<host>"."<name>"  is the entry's attr in that host's packages?
 #   .#nix-pins.brewApiPath                  store path of the brew-api input
 #
-# `stillNeeded` in manifest is a real Nix function (`pkgs: bool`); only its
+# `stillNeeded` in the manifest is a real Nix function (`pkgs: bool`); only its
 # verdict crosses to the CLI. `enable` is the wiring mechanism itself.
 {
   lib,
   root, # flake source root (./.)
-  manifest, # path to manifest
+  manifest, # path to the manifest (inside root)
   platforms, # { <platform> = { input = <nixpkgs flake input>; defaultSystem = "…"; }; }
   brewApi ? null, # the brew-api flake input, when the repo uses brew-nix
+  brewApiInput ? "brew-api", # its name in flake.nix (`nix flake lock --update-input`)
   hosts ? { }, # { <name> = darwinConfigurations.X / nixosConfigurations.Y; } for `installed`
-  autoPinsDir ? null, # directory of Auto Pin JSON files, for the `installed` check
+  autoPinsDir ? null, # directory of Auto Pin JSON files (inside root)
+  caskModule ? null, # file whose uncommented `brewCasks.<token>` lines are the wired casks
+  caskPkgs ? null, # package set casks resolve in (Auto Pins applied), e.g. a host's `pkgs`
+  overlaysDir ? root + "/overlays", # drift lint: every *.nix here needs an entry
+  packagesDir ? root + "/packages", # drift lint: every */default.nix here needs an entry
   config ? {
     allowUnfree = true;
   },
@@ -60,6 +68,21 @@ let
       value = e;
     }) entries
   );
+
+  # The CLI edits the working tree, not the store copy, so it gets paths
+  # relative to the flake root.
+  relPath =
+    p:
+    let
+      r = toString root;
+      s = toString p;
+    in
+    if lib.hasPrefix "${r}/" s then
+      lib.removePrefix "${r}/" s
+    else
+      throw "nix-pins: ${s} is not inside the flake root ${r}";
+
+  optionalRel = p: if p == null then null else relPath p;
 
   systemsFor =
     e: if (e.systems or null) != null then e.systems else [ platforms.${e.platform}.defaultSystem ];
@@ -257,6 +280,17 @@ in
     entries = map clean entries;
   };
 
+  # Where things live, so the CLI hardcodes no repo layout. null = feature not
+  # used by this repo (no Auto Pins / no brew-nix casks).
+  layout = {
+    manifest = relPath manifest;
+    autoPins = optionalRel autoPinsDir;
+    caskModule = optionalRel caskModule;
+    overlays = relPath overlaysDir;
+    packages = relPath packagesDir;
+    brewApiInput = if brewApi == null then null else brewApiInput;
+  };
+
   report = listToAttrs (
     map (e: {
       inherit (e) name;
@@ -267,11 +301,15 @@ in
   src = perSystem srcFor;
   drv = perSystem drvFor;
 
+  casks = if caskPkgs == null then { } else caskPkgs.brewCasks or { };
+
   overlays = lib.genAttrs knownPlatforms (p: {
     pre = overlaysFor p false;
     post = overlaysFor p true;
   });
   applied = lib.genAttrs knownPlatforms appliedFor;
+
+  autoPinOverlays = if autoPinsDir == null then [ ] else import ./auto-pins.nix autoPinsDir;
 
   installed = mapAttrs (
     _: host:

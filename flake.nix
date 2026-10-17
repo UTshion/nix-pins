@@ -1,46 +1,42 @@
 {
-  description = "Version pin tracking tooling — evaluation half.";
+  description = "nix-pins — dashboard + updater for the overlays, packages and pins a flake maintains on top of nixpkgs";
 
-  inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    nixpkgs-darwin.url = "github:nixos/nixpkgs/nixpkgs-unstable";
-  };
+  # Only used to build the CLI wrapper (python3). The evaluation half takes the
+  # consumer's own `lib` and nixpkgs inputs, so it never evaluates against ours.
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
   outputs =
-    inputs@{
-      self,
-      nixpkgs,
-      nixpkgs-darwin,
-      ...
-    }:
+    { self, nixpkgs }:
     let
-      nixPins = import ./eval.nix {
-        lib = nixpkgs.lib;
-        root = ./.;
-        manifest = ./manifest.nix;
-        platforms = {
-          linux = {
-            input = nixpkgs;
-            defaultSystem = "x86_64-linux";
-          };
-          darwin = {
-            input = nixpkgs-darwin;
-            defaultSystem = "aarch64-darwin";
-          };
-        };
-        brewApi = null;
-        hosts = { };
-      };
+      systems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
-      # Evaluation outputs (same surface as the dotnix integration):
-      #   nix-pins.manifest       { platforms, entries }
-      #   nix-pins.report         version + stillNeeded per entry
-      #   nix-pins.src.<name>.<system>  entry src description (urls/hash/…)
-      #   nix-pins.drv.<name>.<system>  entry derivation
-      #   nix-pins.overlays.<platform>  pre / post overlay lists
-      #   nix-pins.applied.<platform>   enabled overlay names
-      #   nix-pins.installed        (empty when hosts = { })
-      nix-pins = nixPins;
+      lib = {
+        # The evaluation half; expose the result as your flake's `nix-pins`
+        # output — the CLI reads everything through `.#nix-pins.*`.
+        # Arguments are documented at the top of eval.nix.
+        mkNixPins = import ./eval.nix;
+
+        # Auto Pins (`<dir>/<token>.json`) → overlays, applied after brew-nix.
+        # mkNixPins exposes the same list as `autoPinOverlays` when given
+        # `autoPinsDir`.
+        autoPinOverlays = import ./auto-pins.nix;
+      };
+
+      packages = forAllSystems (pkgs: {
+        default = pkgs.callPackage ./package.nix { };
+      });
+
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = nixpkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+      });
     };
 }

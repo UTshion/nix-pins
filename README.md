@@ -1,92 +1,148 @@
 # nix-pins
 
-Version pin tracking tooling for Nix configurations — a declarative manifest
-drives a CLI that compares pinned versions against upstream, evaluates overlays
-to extract source metadata, and flags entries ready for deletion.
+A dashboard and updater for the divergences a Nix flake maintains on top of
+nixpkgs: overlays, custom packages, pinned flake inputs and
+[brew-nix](https://github.com/BatteredBunny/brew-nix) casks. A declarative
+manifest says *why* each divergence exists, so the tool can tell you not only
+"this pin is outdated" but also "this overlay can be deleted now".
 
-## Why This Exists
+## Why this exists
 
-~25 divergences from nixpkgs (overlays, custom Darwin packages, pinned flake
-inputs) are invisible without a dashboard. `nix-pins` builds one by *evaluating
-the Nix expressions themselves* — no external dependencies, no duplicated URL
-templates.
+A config that has accumulated ~25 overlays and pins can't be kept current by
+eye. nix-pins builds the dashboard by *evaluating the Nix expressions
+themselves*: no duplicated URL templates, no string-built Nix, pure evaluation
+against the flake's own locked inputs.
 
-## Structure
+## Layout
 
 ```
-flake.nix       Standalone flake — exposes the `nix-pins` output (report /
-                src / drv / overlays / applied / installed).
-eval.nix        The evaluation half — pure Nix, never composes expressions
-                in strings. Exposed as the flake output `nix-pins`.
-manifest.nix    Declarative manifest — every hand-written Entry (overlay /
-                custom package / pinned flake input) that this repo
-                Maintains on top of nixpkgs.
-nix-pins.py     The CLI — dashboard, pin-bump, sync, disable/enable.
-overlays/auto/  Auto Pins — data files that are themselves the entry;
-                no manifest row needed.
+flake.nix         lib.mkNixPins / lib.autoPinOverlays, packages.default (CLI), apps.default
+eval.nix          the evaluation half — becomes your flake's `nix-pins` output
+auto-pins.nix     Auto Pin loader: <dir>/<token>.json → overlays
+nix-pins.py       the CLI — dashboard, update, sync, disable/enable
+package.nix       the CLI package (stdlib-only Python, wrapped)
+example/manifest.nix  documented schema + example entries
 ```
 
-## How It Works
+## How it works
 
-1. `manifest.nix` declares every tracked unit (Entry) with its source, target
-   nixpkgs attribute, system, and — for overlays — an `enable` field that
-   decides wiring.
+1. **The manifest** lists every hand-written Entry with its source, target
+   nixpkgs attribute, systems and — for overlays — an `enable` field that *is*
+   the wiring: your flake applies exactly the enabled overlays.
+2. **eval.nix** (`lib.mkNixPins`) turns the manifest into flake attributes:
+   versions, `stillNeeded` verdicts, each entry's `src`/`drv`, the overlay
+   lists, per-host reachability — and the repo layout the CLI should use.
+3. **The CLI** does the rest — HTTP lookups for upstream versions, file
+   rewriting, the dashboard — reading everything through `.#nix-pins.*`.
 
-2. `eval.nix` evaluates the full Nix expressions, extracting version strings,
-   hashes, and derivations without shell-out or string composition.
-
-3. `nix-pins.py` (Python) does HTTP (upstream version fetch) and file
-   rewriting, driven by the manifest and the evaluation results.
-
-### The Purpose Taxonomy
+### The Purpose taxonomy
 
 Each Entry has a `purpose` that drives deletion decisions:
 
-- **version-lag** — outpaces a lagging nixpkgs; droppable once nixpkgs
-  catches up (dashboard shows `DROP?` when nixpkgs version ≥ pin).
+| Purpose       | Why the Entry exists                     | Deletable when…                          |
+| ------------- | ---------------------------------------- | ---------------------------------------- |
+| `version-lag` | nixpkgs lags upstream                    | nixpkgs catches up (`…+DROP?` status)    |
+| `compat`      | makes the package work at all            | nixpkgs fixes the underlying problem     |
+| `packaging`   | we are the packager; no nixpkgs package  | (never, unless the package is abandoned) |
 
-- **compat** — makes the package work at all (platform/build fix); NOT
-  droppable on version parity (dashboard shows `REVIEW / stillNeeded`).
+`stillNeeded` predicates are real Nix functions (`pkgs: bool`) that answer
+whether a compat overlay is still required — they catch fixes that land
+without a version bump.
 
-- **packaging** — we are the packager; no nixpkgs/brew equivalent.
+## Using it from your flake
 
-## Quick Start (standalone)
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nix-pins = {
+      url = "github:UTshion/nix-pins";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-```bash
-# Dashboard: check all pins against upstream
-./nix-pins.py
+  outputs = { self, nixpkgs, nix-pins, ... }:
+    let
+      nixPins = nix-pins.lib.mkNixPins {
+        lib = nixpkgs.lib;
+        root = ./.;
+        manifest = ./nix-pins/manifest.nix;
+        platforms.linux = {
+          input = nixpkgs;
+          defaultSystem = "x86_64-linux";
+        };
+        # optional — see the argument list at the top of eval.nix:
+        # brewApi, autoPinsDir, caskModule, caskPkgs, hosts, overlaysDir, packagesDir
+      };
+    in
+    {
+      # The CLI reads everything through this output.
+      nix-pins = nixPins;
 
-# Dashboard + which hosts use each entry (requires host config evaluation)
-./nix-pins.py check --installed
+      # Same revision as the eval half: run it with `nix run .#nix-pins`.
+      packages.x86_64-linux.nix-pins = nix-pins.packages.x86_64-linux.default;
 
-# Bump a single pin (fetches upstream, prefetches, verifies build)
-./nix-pins.py update <name>
-
-# Disable an entry (sets enable = false in manifest)
-./nix-pins.py disable <name>
-
-# Interactive sync (review warnings, bulk-apply updates)
-./nix-pins.py sync
+      nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+        modules = [
+          { nixpkgs.overlays = nixPins.overlays.linux.pre ++ nixPins.overlays.linux.post; }
+          # …
+        ];
+      };
+    };
+}
 ```
 
-### Usage from a user repo (dotnix)
+With brew-nix, apply the lists around its overlay:
+`overlays.darwin.pre ++ [ brew-nix.overlays.default ] ++ nixPins.autoPinOverlays ++ overlays.darwin.post`.
 
-When a user repo contains `nix-pins/` at the root (same flat structure), set:
+Every `overlays/*.nix` and `packages/*/default.nix` needs a manifest entry —
+`check` reports drift in both directions.
+
+## CLI
+
+Run it from anywhere inside the flake (or set `NIX_PINS_REPO`):
 
 ```bash
-NIX_PINS_DIR=./nix-pins ./nix-pins.py check --installed
+nix run .#nix-pins                        # = check: dashboard + warnings
+nix run .#nix-pins -- check --installed   # + which hosts actually install each entry (slow)
+nix run .#nix-pins -- list                # entries + notes
+nix run .#nix-pins -- update <name>       # bump version + hashes in place, verify build
+nix run .#nix-pins -- update --all        # every enabled auto-updatable pin (no major bumps)
+nix run .#nix-pins -- sync                # warnings → pick by number → run the batch
+nix run .#nix-pins -- sync --select all   # the same, non-interactively
+nix run .#nix-pins -- disable <name>      # flip `enable` (enable to undo)
 ```
 
-The CLI resolves `REPO` from the env var and defaults to the parent
-directory when unset — enabling system-wide installation alongside a local
-clone.
+A two-line wrapper script in your repo keeps this short; set `NIX_PINS_PROG` to
+its path so hints print the right command.
 
-## Notes
+Writing subcommands require the files nix-pins owns (manifest, overlays,
+packages, Auto Pins, flake.nix/flake.lock) to be committed, so
+`git checkout --` always undoes a run (`--allow-dirty` opts out). Nothing is
+ever committed for you.
 
-- Auto Pins (`overlays/auto/<token>.json`) are Homebrew cask pins that trust
-  Homebrew's trust model: `url + sha256` come from `formulae.brew.sh`, and
-  `nix build` verifies the artifact against that hash.
-- `stillNeeded` predicates are real Nix functions (`pkgs: bool`) that answer
-  whether an overlay is still required after nixpkgs catches up.
-- The dashboard exit codes: `0` = clean, `1` = outdated / drift (file as
-  issue), `2` = broken manifest or tool (fail the check).
+Exit codes: `0` clean, `1` work to do (outdated pin, drift), `2` the manifest or
+the tool is broken — so CI can file an issue on `1` and fail on `2`.
+
+## Auto Pins (brew-nix casks)
+
+brew-nix freezes cask versions at the brew-api input's snapshot. `sync` can
+outrun it for single casks by writing `<autoPinsDir>/<token>.json` — pure data
+(token / version / url / hash / enabled); `auto-pins.nix` is the one place that
+turns it into an overlay. The JSON file *is* the Entry: no manifest row.
+
+Trust model: an Auto Pin trusts Homebrew. `url` + `sha256` come from
+`formulae.brew.sh`, and `nix build` verifies the artifact against *that* hash,
+not against an upstream signature. Casks with `sha256 = no_check` are never
+pinned.
+
+## Developing nix-pins
+
+Point a consuming flake at a local checkout:
+
+```bash
+nix flake lock --override-input nix-pins path:/path/to/nix-pins
+```
+
+Requirements: `nix` (flakes enabled), `git`, network. `gh` is used for the
+GitHub API when available (else `$GITHUB_TOKEN`, else anonymous).

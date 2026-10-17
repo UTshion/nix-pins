@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""nix-pins — dashboard + auto-updater for the Entries this repo Maintains on top
-of nixpkgs (overlays/, packages/, pinned flake inputs).
+"""nix-pins — dashboard + auto-updater for the Entries a flake maintains on top
+of nixpkgs (overlays, custom packages, pinned flake inputs, brew-nix casks).
 
-Vocabulary (see CONTEXT.md): an *Entry* is one tracked unit; a *Pin* is an Entry
-that fixes a version (derived from versionVar/versionRegex); *Purpose* says why
-the Entry exists (version-lag | compat | packaging) and thus when it can be
-deleted; *Wired* means flake.nix references it (≠ installed on a host).
+Vocabulary: an *Entry* is one tracked unit; a *Pin* is an Entry that fixes a
+version (derived from versionVar/versionRegex); *Purpose* says why the Entry
+exists (version-lag | compat | packaging) and thus when it can be deleted;
+*Enabled* means the flake applies it (≠ installed on a host).
 
 Subcommands:
   check   (default) compare every Pin against the upstream latest and the
           flake-locked nixpkgs, evaluate compat Entries' stillNeeded predicates,
-          lint for Drift (overlay/package files missing from manifest, and
+          lint for Drift (overlay/package files missing from the manifest, and
           manifest entries whose file is gone), print a dashboard.
   update  bump version + hash(es) in place, then verify with `nix build` where the
           current platform can. On build failure the file is reverted (the attempted
@@ -23,23 +23,25 @@ Subcommands:
 Exit codes: 0 = clean, 1 = work to do (outdated pin, drift, review), 2 = the tool
 or its configuration is broken (bad manifest entry, failed eval).
 
-The Nix half lives in eval.nix, exposed by the flake output; this script never
-composes Nix expressions in strings. Evaluation is pure and uses the flake's own
-locked inputs (report/src/drv/installed/overlays all come from the flake).
+The Nix half lives in eval.nix (`lib.mkNixPins`), exposed by the consuming
+flake as its `nix-pins` output; this script never composes Nix expressions in
+strings. Evaluation is pure and uses the flake's own locked inputs
+(report/src/drv/installed/overlays all come from `.#nix-pins.*`), and so does
+the repo layout (`.#nix-pins.layout`: manifest, Auto Pin dir, cask module, …).
 Everything the updater needs (URLs, hash mode, artifact names) is derived by
 evaluating the overlay/package itself, so no URL templates are duplicated here.
-Entries come from two places: manifest (via the flake, so `stillNeeded` is a real
-function and `enable` is the actual wiring), and the self-describing Auto Pin
-data files in overlays/auto/*.json — those are the entry, so they are never
-listed in the manifest.
+Entries come from two places: the manifest (via the flake, so `stillNeeded` is a
+real function and `enable` is the actual wiring), and the self-describing Auto
+Pin data files (<autoPins>/<token>.json) — those are the entry, so they are
+never listed in the manifest.
 
-Stdlib only. Requires: nix (flakes enabled), network; `gh` is used for the
+Environment:
+  NIX_PINS_REPO  flake to operate on (default: the nearest directory at or
+                 above the working directory that contains flake.nix)
+  NIX_PINS_PROG  how to spell this command in hints (default: nix-pins)
+
+Stdlib only. Requires: nix (flakes enabled), git, network; `gh` is used for the
 GitHub API when available (falls back to plain HTTPS, honoring $GITHUB_TOKEN).
-
-Environment variables:
-  NIX_PINS_DIR    path to the directory where this script lives (parent of
-                  the current repo root when invoked from a user's repo).
-                  When not set, REPO defaults to the parent directory.
 """
 
 import argparse
@@ -62,15 +64,20 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-# Allow overriding the repo root (for standalone usage outside a user repo).
-# When not set, REPO defaults to the parent directory (scripts/nix-pins/… in a user repo).
-_NIX_PINS_DIR = os.environ.get("NIX_PINS_DIR", None)
-if _NIX_PINS_DIR:
-    REPO = Path(_NIX_PINS_DIR).resolve().parent
-else:
-    REPO = SCRIPT_DIR.parents[1]
-MANIFEST = SCRIPT_DIR / "manifest.nix"
+def find_repo():
+    """$NIX_PINS_REPO, else the nearest flake at or above the working directory."""
+    env = os.environ.get("NIX_PINS_REPO")
+    if env:
+        return Path(env).resolve()
+    here = Path.cwd().resolve()
+    for d in (here, *here.parents):
+        if (d / "flake.nix").is_file():
+            return d
+    return here
+
+
+REPO = find_repo()
+PROG = os.environ.get("NIX_PINS_PROG") or "nix-pins"
 
 # Platform names known to the flake (`.#nix-pins.manifest.platforms`), filled in
 # by load_entries(). The platform → nixpkgs-input mapping itself lives in
@@ -96,26 +103,14 @@ EXIT_ACTION = 1
 EXIT_ERROR = 2
 
 # ── cask 監視(brew-nix 経由のインストール)──────────────────────────────────
-# modules/darwin/brew-nix.nix の非コメント `brewCasks.<token>` 行を wired な
-# cask とみなす。base は brew-api input(flake.lock で固定されたスナップショット)
-# の cask.json、latest は formulae.brew.sh の live API。差分は sync で
-# Auto Pin(overlays/auto/<token>.json)として個別に先回りできる。
-CASK_MODULE_REL = "modules/darwin/brew-nix.nix"
+# layout.caskModule の非コメント `brewCasks.<token>` 行を wired な cask とみなす。
+# base は brew-api input(flake.lock で固定されたスナップショット)の cask.json、
+# latest は formulae.brew.sh の live API。差分は sync で Auto Pin
+# (<layout.autoPins>/<token>.json)として個別に先回りできる。
 
-# Auto Pins: one JSON data file per pin, read by overlays/auto/default.nix.
-# The file is the entry — there is no manifest row to keep in sync.
-AUTO_REL = "overlays/auto"
-AUTO_SCHEMA = 1  # must match `schema` in overlays/auto/default.nix
-
-# Paths nix-pins may rewrite. Mutating subcommands require these to be clean, so
-# that `git checkout --` is always a complete undo.
-OWNED_PATHS = [
-    "manifest.nix",
-    "overlays",
-    "packages",
-    "flake.nix",
-    "flake.lock",
-]
+# Auto Pins: one JSON data file per pin, read by auto-pins.nix
+# (lib.autoPinOverlays). The file is the entry — there is no manifest row.
+AUTO_SCHEMA = 1  # must match `schema` in auto-pins.nix
 
 
 class ConfigError(RuntimeError):
@@ -177,7 +172,7 @@ def require_clean_tree(args):
     """
     if getattr(args, "allow_dirty", False):
         return True
-    p = run(["git", "status", "--porcelain", "--", *OWNED_PATHS], check=False)
+    p = run(["git", "status", "--porcelain", "--", *owned_paths()], check=False)
     if p.returncode != 0:
         print(yellow("warning: could not read git status; skipping the clean-tree check"),
               file=sys.stderr)
@@ -222,6 +217,36 @@ def flake_eval(attrpath, raw=False, apply=None):
     return p.stdout.strip() if raw else json.loads(p.stdout)
 
 
+_layout = None
+
+
+def layout():
+    """Repo-relative paths from `.#nix-pins.layout` — the flake, not this script,
+    knows where its manifest, Auto Pins and cask module live. null entries mean
+    the repo does not use that feature."""
+    global _layout
+    if _layout is None:
+        try:
+            _layout = flake_eval(flake_attr("nix-pins", "layout"))
+        except RuntimeError as ex:
+            raise ConfigError(f"the flake's nix-pins output does not evaluate:\n{ex}") from ex
+    return _layout
+
+
+def layout_path(key):
+    rel = layout().get(key)
+    return REPO / rel if rel else None
+
+
+def owned_paths():
+    """Paths nix-pins may rewrite. Mutating subcommands require these to be
+    clean, so that `git checkout --` is always a complete undo."""
+    lay = layout()
+    paths = [lay["manifest"], lay["overlays"], lay["packages"], lay.get("autoPins"),
+             "flake.nix", "flake.lock"]
+    return list(dict.fromkeys(p for p in paths if p))
+
+
 def installed_map():
     """`.#nix-pins.installed`, one host at a time: a host whose own config no
     longer evaluates (or whose sources are gone) degrades to a warning instead
@@ -262,12 +287,20 @@ def load_manifest():
     return envelope["entries"]
 
 
+def auto_dir():
+    """The Auto Pin directory (absolute), or None when the flake has none."""
+    return layout_path("autoPins")
+
+
 def auto_pin_path(token):
-    return REPO / AUTO_REL / f"{token}.json"
+    d = auto_dir()
+    if d is None:
+        raise ConfigError("this flake has no Auto Pin directory (mkNixPins autoPinsDir)")
+    return d / f"{token}.json"
 
 
 def read_auto_pin(path):
-    """Load one overlays/auto/*.json, rejecting whatever the Nix loader would."""
+    """Load one <autoPins>/*.json, rejecting whatever the Nix loader would."""
     rel = path.relative_to(REPO).as_posix()
     try:
         data = json.loads(path.read_text())
@@ -296,16 +329,19 @@ def read_auto_pin(path):
 
 
 def auto_entries():
-    """overlays/auto/*.json are self-describing Entries — never in the manifest."""
+    """<autoPins>/*.json are self-describing Entries — never in the manifest."""
+    d = auto_dir()
+    if d is None:
+        return []
     out = []
-    for path in sorted((REPO / AUTO_REL).glob("*.json")):
+    for path in sorted(d.glob("*.json")):
         data = read_auto_pin(path)
         out.append(
             {
                 "name": data["token"],
                 "purpose": ["version-lag"],
                 "kind": "auto-pin",
-                "file": f"{AUTO_REL}/{path.name}",
+                "file": path.relative_to(REPO).as_posix(),
                 "attr": f"brewCasks.{data['token']}",
                 "platform": "darwin",
                 "systems": ["aarch64-darwin"],
@@ -418,13 +454,24 @@ def brew_api_casks():
     return _brew_api_cache
 
 
+def brew_api_input():
+    """flake.nix での brew-api input 名(layout.brewApiInput)。"""
+    name = layout().get("brewApiInput")
+    if not name:
+        raise ConfigError("this flake passes no brewApi to mkNixPins")
+    return name
+
+
 def wired_cask_tokens():
-    """modules/darwin/brew-nix.nix の非コメント brewCasks.<token> 行を列挙。"""
+    """layout.caskModule の非コメント brewCasks.<token> 行を列挙(未設定なら空)。"""
+    module = layout_path("caskModule")
+    if module is None:
+        return []
     tokens = []
-    for line in (REPO / CASK_MODULE_REL).read_text().splitlines():
+    for line in module.read_text().splitlines():
         m = re.match(r"^\s*(#\s*)?brewCasks\.([A-Za-z0-9_-]+)", line)
         if m and not m.group(1) and m.group(2) not in tokens:
-            tokens.append(m["token"])
+            tokens.append(m.group(2))
     return tokens
 
 
@@ -678,7 +725,7 @@ def upstream_latest(entry):
 
 def nix_pins_report():
     """→ {name: {nixpkgs: version|None, stillNeeded: True|False|None|"error"}}."""
-    return flake_eval(flake_attr("nix-pins", "manifest"))
+    return flake_eval(flake_attr("nix-pins", "report"))
 
 
 def eval_src(entry, system):
@@ -883,7 +930,7 @@ def print_table(rows):
     if show_installed:
         headers.append("INSTALLED")
     if not rows:
-        print(dim("(no entries — add one to scripts/nix-pins/manifest)"))
+        print(dim(f"(no entries — add one to {layout()['manifest']})"))
         return
     cells = []
     for r in rows:
@@ -916,30 +963,34 @@ def print_table(rows):
 def drift_report(entries):
     """Drift lint in both directions:
 
-    - a file that should have a manifest entry but has none;
+    - a file that should have a manifest Entry but has none;
     - an Entry whose file is gone (a stale row that used to crash the dashboard).
 
     Auto Pins are exempt from the first check — the JSON file *is* the Entry, so
     the two can never disagree.
     """
+    lay = layout()
     tracked = {e["file"] for e in entries}
-    found = [f"overlays/{p.name}" for p in sorted((REPO / "overlays").glob("*.nix"))]
-    found += [
-        p.relative_to(REPO).as_posix() for p in sorted((REPO / "packages").glob("*/default.nix"))
-    ]
+    found = [p.relative_to(REPO).as_posix()
+             for p in sorted(layout_path("overlays").glob("*.nix"))]
+    found += [p.relative_to(REPO).as_posix()
+              for p in sorted(layout_path("packages").glob("*/default.nix"))]
     problems = [
-        f"{f} has no entry in the nix-pins manifest — add one"
+        f"{f} has no entry in {lay['manifest']} — add one"
         for f in found
         if f not in tracked
     ]
-    # overlays/auto holds the loader plus JSON data. A stray .nix in there is a
-    # leftover from before Auto Pins became data.
-    problems += [
-        f"{AUTO_REL}/{p.name} is a hand-written Auto Pin — those are"
-        f" {AUTO_REL}/<token>.json data files now; delete or convert it"
-        for p in sorted((REPO / AUTO_REL).glob("*.nix"))
-        if p.name != "default.nix"
-    ]
+    # The Auto Pin directory holds JSON data only (the loader ships with
+    # nix-pins as lib.autoPinOverlays). A .nix in there is a leftover: a
+    # hand-written pin from before Auto Pins became data, or the old in-repo
+    # loader.
+    if auto_dir() is not None:
+        problems += [
+            f"{lay['autoPins']}/{p.name} is Nix code in the Auto Pin directory — pins are"
+            f" {lay['autoPins']}/<token>.json data and the loader is nix-pins'"
+            " autoPinOverlays; delete or convert it"
+            for p in sorted(auto_dir().glob("*.nix"))
+        ]
     missing = {}
     for e in entries:
         if not is_auto_entry(e) and not (REPO / e["file"]).exists():
@@ -1014,7 +1065,7 @@ def build_cask_rows(entries):
 
 
 def brew_api_age():
-    meta = locked_input_meta("brew-api")
+    meta = locked_input_meta(brew_api_input())
     dt = datetime.datetime.fromtimestamp(meta["lastModified"])
     days = max(0, (datetime.datetime.now() - dt).days)
     return f"{dt:%Y-%m-%d} 取得({days}日前)"
@@ -1086,9 +1137,9 @@ def cmd_check(args):
             if r["status"] == "OUTDATED":
                 warned = True
                 if r["entry"].get("releaseJson"):
-                    hint = f" — run: nix flake lock --update-input {r['name']}  (or nix-pins.py update {r['name']})"
+                    hint = f" — run: nix flake lock --update-input {r['name']}  (or {PROG} update {r['name']})"
                 else:
-                    hint = f" — run: nix-pins.py update {r['name']}"
+                    hint = f" — run: {PROG} update {r['name']}"
                 print(
                     red(f"⚠ {r['name']}: pinned {r['pinned']} < upstream {r['latest']}")
                     + hint
@@ -1147,7 +1198,8 @@ def cmd_check(args):
                         f"⚠ cask {c['token']}: base {cask_display_version(c['base'])} "
                         f"< live {cask_display_version(c['live_version'])}"
                     )
-                    + " — `sync` で Auto Pin を作るか、`nix flake lock --update-input brew-api` で全体を進める"
+                    + f" — `{PROG} sync` で Auto Pin を作るか、"
+                    f"`nix flake lock --update-input {brew_api_input()}` で全体を進める"
                 )
             elif c["status"] == "MISMATCH":
                 warned = True
@@ -1254,7 +1306,9 @@ def update_release_json_input(entry, args, target_version=None, from_all=False):
         print(red(f"✗ {name}: flake lock update failed:\n{p.stderr.strip()[-800:]}"))
         return False
 
-    # Re-read after lock refresh; upstream CI may lag the tag briefly.
+    # Re-read after lock refresh (the cached store path is the old lock's);
+    # upstream CI may lag the tag briefly.
+    _flake_input_paths.pop(name, None)
     new_ver, err = pinned_version(entry)
     if err:
         print(red(f"✗ {name}: lock updated but could not read release.json: {err}"))
@@ -1262,7 +1316,7 @@ def update_release_json_input(entry, args, target_version=None, from_all=False):
     if new_ver != latest and not args.force:
         print(yellow(f"⚠ {name}: lock now at release.json={new_ver}, upstream tag={latest} "
                      f"(CI may still be bumping release.json on the fork)"))
-    systems = entry.get("systems") or [PLATFORM_INPUT[entry["platform"]][1]]
+    systems = entry["systems"]  # resolved by eval.nix (manifest value or platform default)
     if args.no_build:
         print(yellow("   build verification skipped (--no-build)"))
     elif current_system() not in systems:
@@ -1306,7 +1360,7 @@ def update_entry(entry, args, target_version=None, from_all=False):
             latest = upstream_latest(entry)
         except Exception as ex:  # noqa: BLE001
             print(red(f"✗ {name}: upstream lookup failed: {ex}"))
-
+            return False
     if latest is None:
         print(red(f"✗ {name}: no upstream source configured; pass an explicit {name}=<version>"))
         return False
@@ -1416,11 +1470,11 @@ def cmd_update(args):
     for spec in args.names:
         name, _, ver = spec.partition("=")
         if name not in by_name:
-            print(red(f"✗ unknown entry: {name} (see `nix-pins.py list`)"))
+            print(red(f"✗ unknown entry: {name} (see `{PROG} list`)"))
             return EXIT_ERROR
         targets.append((by_name[name], ver or None, False))
     if not targets:
-        print("nothing to update — pass entry names or --all (see `nix-pins.py list`)")
+        print(f"nothing to update — pass entry names or --all (see `{PROG} list`)")
         return EXIT_OK
     if not args.dry_run and not require_clean_tree(args):
         return EXIT_ERROR
@@ -1445,15 +1499,15 @@ def cmd_list(_args):
 
 
 # ── Auto Pin(cask の個別 version-lag ピン)──────────────────────────────────
-# Generated output is *data only*: overlays/auto/<token>.json. The override
-# mechanism is written once, by hand, in overlays/auto/default.nix. So changing
+# Generated output is *data only*: <autoPins>/<token>.json. The override
+# mechanism is written once, by hand, in auto-pins.nix. So changing
 # that mechanism never means regenerating every pin, and this script never emits
 # Nix syntax — no quoting or `${}` escaping hazards to guard against.
 # The JSON file is also the Entry itself: nothing is appended to the manifest.
 
 
 def write_auto_pin(token, live, *, enabled=True, adopted=None, base_at_adoption=None):
-    """(Re)generate overlays/auto/<token>.json from a live cask API response."""
+    """(Re)generate <autoPins>/<token>.json from a live cask API response."""
     sha = live.get("sha256")
     if not sha or sha == "no_check":
         raise RuntimeError(
@@ -1472,8 +1526,8 @@ def write_auto_pin(token, live, *, enabled=True, adopted=None, base_at_adoption=
         "adopted": adopted or datetime.date.today().isoformat(),
         "baseAtAdoption": base_at_adoption,
     }
-    (REPO / AUTO_REL).mkdir(parents=True, exist_ok=True)
     path = auto_pin_path(token)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return path
 
@@ -1496,14 +1550,14 @@ def build_cask(token):
     """flake 経由で 1 cask をビルド検証(darwinOverlays 適用後の実物)。"""
     return run(
         ["nix", "build", "--no-link",
-         f'.#darwinConfigurations.default.pkgs.brewCasks."{token}"'],
+         f".#{flake_attr('nix-pins', 'casks', token)}"],
         check=False,
     )
 
 
 def adopt_cask(token, live, base, args):
     """Grow an Auto Pin for an OUTDATED cask. One data file, nothing else."""
-    rel = f"{AUTO_REL}/{token}.json"
+    rel = auto_pin_path(token).relative_to(REPO).as_posix()
     live_disp = cask_display_version(live["version"])
     base_disp = cask_display_version(base) if base else "?"
     if args.dry_run:
@@ -1561,7 +1615,7 @@ def readopt_entry(entry, args, target_version=None, from_all=False):
     if target_version and target_version != latest:
         print(red(f"✗ {name}: an Auto Pin can only be regenerated at the live version "
                   f"({latest}) — to hold a different one, move it to a hand-written "
-                  "overlay in overlays/"))
+                  "overlay"))
         return False
     c = compare_versions(current, latest)
     if c == 0 and not args.force:
@@ -1622,41 +1676,42 @@ def readopt_entry(entry, args, target_version=None, from_all=False):
 
 
 def set_manifest_enable(entry, enable):
-    """Flip `enable = true|false;` inside the entry's block in manifest.
+    """Flip `enable = true|false;` inside the entry's block in the manifest.
 
     A single literal-value edit, scoped between this entry's `name = "…";` and
     the next one — never structural surgery, and never a commented-out line in
     flake.nix (flake.nix builds its overlay lists from this field).
     """
     name = entry["name"]
-    text = MANIFEST.read_text()
+    manifest = layout_path("manifest")
+    text = manifest.read_text()
     anchor = re.search(r'name = "' + re.escape(name) + r'";', text)
     if not anchor:
-        print(red(f"✗ {name}: entry not found in {MANIFEST.name}"))
+        print(red(f"✗ {name}: entry not found in {layout()['manifest']}"))
         return False
     nxt = re.compile(r'name = "').search(text, anchor.end())
     end = nxt.start() if nxt else len(text)
     seg = text[anchor.end():end]
     m = re.search(r"(\benable\s*=\s*)(true|false)(\s*;)", seg)
     if not m:
-        print(red(f"✗ {name}: no `enable` field found in its {MANIFEST.name} block"))
+        print(red(f"✗ {name}: no `enable` field found in its {layout()['manifest']} block"))
         return False
     if (m.group(2) == "true") == enable:
         print(cyan(f"→ {name}: already {'enabled' if enable else 'disabled'}"))
         return True
     new_seg = seg[: m.start()] + m.group(1) + ("true" if enable else "false") + m.group(3) + seg[m.end():]
-    MANIFEST.write_text(text[: anchor.end()] + new_seg + text[end:])
+    manifest.write_text(text[: anchor.end()] + new_seg + text[end:])
     if entry["kind"] == "overlay":
         mech = f"flake.nix now {'applies' if enable else 'stops applying'} the overlay"
     else:
         mech = "declared intent for the dashboard; the consuming module is untouched"
-    print(green(f"✓ {name}: {'enabled' if enable else 'disabled'} (`enable` in {MANIFEST.name} — {mech})"))
+    print(green(f"✓ {name}: {'enabled' if enable else 'disabled'} (`enable` in {layout()['manifest']} — {mech})"))
     return True
 
 
 def toggle_entry(entry, enable):
     """Flip an Entry's enable state. Always a data edit: the Auto Pin JSON field,
-    or the `enable` field in manifest — flake.nix is never touched."""
+    or the `enable` field in the manifest — flake.nix is never touched."""
     name = entry["name"]
     if is_auto_entry(entry):
         path = REPO / entry["file"]
@@ -1675,7 +1730,7 @@ def cmd_toggle(args, enable):
     entries = load_entries()
     by_name = {e["name"]: e for e in entries}
     if args.name not in by_name:
-        print(red(f"✗ unknown entry: {args.name} (see `nix-pins.py list`)"))
+        print(red(f"✗ unknown entry: {args.name} (see `{PROG} list`)"))
         return EXIT_ERROR
     if not require_clean_tree(args):
         return EXIT_ERROR
@@ -1772,7 +1827,7 @@ def cmd_sync(args):
                     "kind": "disable",
                     "name": r["name"],
                     "major": False,
-                    "label": f"[disable] {r['name']}: nixpkgs 側で解消 — flake.nix の import 行をコメントアウト",
+                    "label": f"[disable] {r['name']}: nixpkgs 側で解消 — manifest の enable を false に",
                 }
             )
     if any(a["kind"] == "adopt" for a in actions):
@@ -1783,9 +1838,9 @@ def cmd_sync(args):
         actions.append(
             {
                 "kind": "input",
-                "name": "brew-api",
+                "name": brew_api_input(),
                 "major": False,
-                "label": f"[input]   brew-api input({age})を最新スナップショットへ — 全 cask が一斉に動く(個別ピンの代替)",
+                "label": f"[input]   {brew_api_input()} input({age})を最新スナップショットへ — 全 cask が一斉に動く(個別ピンの代替)",
             }
         )
 
@@ -1831,7 +1886,7 @@ def cmd_sync(args):
             ok = toggle_entry(by_name[a["name"]], enable=False) and ok
         elif a["kind"] == "input":
             print("→ brew-api input を更新中…")
-            pr = run(["nix", "flake", "lock", "--update-input", "brew-api"], check=False)
+            pr = run(["nix", "flake", "lock", "--update-input", brew_api_input()], check=False)
             if pr.returncode == 0:
                 print(green("✓ brew-api input updated ")
                       + dim("(全 cask の base が動いた — check で Auto Pin の DROP? を確認)"))
@@ -1852,8 +1907,8 @@ def main():
     dirty.add_argument("--allow-dirty", action="store_true",
                        help="write even when the affected files have uncommitted changes")
     parser = argparse.ArgumentParser(
-        prog="nix-pins.py",
-        description="dashboard + updater for version pins in overlays/ and packages/",
+        prog=PROG,
+        description="dashboard + updater for the overlays, packages and pins a flake maintains on top of nixpkgs",
         parents=[common],
         epilog="exit codes: 0 = clean, 1 = work to do, 2 = tool/config error",
     )
